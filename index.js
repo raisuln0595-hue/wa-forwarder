@@ -3,12 +3,13 @@ const pino = require('pino');
 const axios = require('axios');
 const FormData = require('form-data');
 
-// Render-এর Environment Variables থেকে তথ্য রিড করবে
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const WHATSAPP_PHONE_NUMBER = process.env.WHATSAPP_PHONE_NUMBER; // যেমন: 88017xxxxxxxx
 
-// টেলিগ্রামে টেক্সট মেসেজ পাঠানোর ফাংশন (পেয়ারিং কোডের জন্য)
+let activeSock = null; // WhatsApp Socket গ্লোবালি স্টোর করার জন্য
+
+// টেলিগ্রামে টেক্সট মেসেজ পাঠানোর ফাংশন (এক ক্লিকে কপি করার কোড ব্লক সহ)
 async function sendTextToTelegram(text) {
     try {
         await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
@@ -16,13 +17,13 @@ async function sendTextToTelegram(text) {
             text: text,
             parse_mode: 'Markdown'
         });
-        console.log('✅ টেলিগ্রামে পেয়ারিং কোড পাঠানো হয়েছে!');
+        console.log('✅ টেলিগ্রামে মেসেজ পাঠানো হয়েছে!');
     } catch (error) {
         console.error('❌ টেলিগ্রামে মেসেজ পাঠাতে সমস্যা হয়েছে:', error.response ? error.response.data : error.message);
     }
 }
 
-// ফাইল বা মিডিয়া টেলিগ্রামে পাঠানোর ফাংশন
+// ফাইল বা যেকোনো মিডিয়া টেলিগ্রামে পাঠানোর ফাংশন
 async function sendToTelegram(buffer, fileName, caption) {
     try {
         const form = new FormData();
@@ -41,6 +42,63 @@ async function sendToTelegram(buffer, fileName, caption) {
     }
 }
 
+// পেয়ারিং কোড জেনারেট করে টেলিগ্রামে পাঠানোর ফাংশন
+async function generateAndSendPairingCode(sock) {
+    if (!WHATSAPP_PHONE_NUMBER) {
+        await sendTextToTelegram('❌ কোনো WhatsApp নম্বর দেওয়া নেই! দয়া করে Render-এর Environment Variable-এ `WHATSAPP_PHONE_NUMBER` যুক্ত করুন।');
+        return;
+    }
+
+    try {
+        const cleanedNumber = WHATSAPP_PHONE_NUMBER.replace(/[^0-9]/g, '');
+        console.log(`পেয়ারিং কোড জেনারেট করা হচ্ছে নম্বর: ${cleanedNumber} এর জন্য...`);
+        
+        let code = await sock.requestPairingCode(cleanedNumber);
+        code = code?.match(/.{1,4}/g)?.join('-') || code;
+
+        // ব্যাকটিক্স (```) ব্যবহার করার কারণে টেলিগ্রাম এটিতে এক ক্লিক বা এক ট্যাপ করলেই কপি করার অপশন দিবে
+        const pairingMsg = `🔑 **WhatsApp Pairing Code**\n\nনিচের কোডটিতে **একবার ক্লিক করলেই কপি** হয়ে যাবে:\n\n\`\`\`${code}\`\`\`\n\n📱 **যুক্ত করার নিয়ম:**\n১. WhatsApp-এ গিয়ে Linked Devices > Link a Device-এ যান।\n২. **Link with phone number instead**-এ ক্লিক করে কোডটি দিন।`;
+        
+        await sendTextToTelegram(pairingMsg);
+    } catch (err) {
+        console.error('পেয়ারিং কোড নিতে সমস্যা হয়েছে:', err);
+        await sendTextToTelegram('❌ পেয়ারিং কোড আনতে সমস্যা হয়েছে। সার্ভার রিস্টার্ট করে আবার চেষ্টা করুন।');
+    }
+}
+
+// টেলিগ্রাম থেকে `/code` কমান্ড রিসিভ করার জন্য লিসেনার
+async function listenTelegramCommands() {
+    let offset = 0;
+    setInterval(async () => {
+        try {
+            const res = await axios.get(`[https://api.telegram.org/bot$](https://api.telegram.org/bot$){TELEGRAM_BOT_TOKEN}/getUpdates`, {
+                params: { offset, timeout: 30 }
+            });
+
+            for (const update of res.data.result) {
+                offset = update.update_id + 1;
+                const message = update.message;
+
+                if (message && message.text) {
+                    const chatId = message.chat.id.toString();
+                    const text = message.text.trim();
+
+                    // যদি নির্দিষ্ট চ্যাট আইডি থেকে `/code` লেখা হয়
+                    if (chatId === TELEGRAM_CHAT_ID.toString() && text === '/code') {
+                        if (activeSock && !activeSock.authState.creds.registered) {
+                            await generateAndSendPairingCode(activeSock);
+                        } else {
+                            await sendTextToTelegram('ℹ️ WhatsApp ইতিমধ্যে কানেক্টেড রয়েছে অথবা সকেট প্রস্তুত হচ্ছে। নতুন কোড চাইলে সার্ভার রিস্টার্ট করুন।');
+                        }
+                    }
+                }
+            }
+        } catch (err) {
+            // পোলিং এরর ইগনোর করা ভালো যাতে লুপ বন্ধ না হয়
+        }
+    }, 3000);
+}
+
 async function connectToWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
 
@@ -50,25 +108,14 @@ async function connectToWhatsApp() {
         printQRInTerminal: false
     });
 
+    activeSock = sock;
     sock.ev.on('creds.update', saveCreds);
 
-    // নম্বর দেওয়া থাকলে এবং রেজিস্টার্ড না থাকলে পেয়ারিং কোড রিকোয়েস্ট করবে
+    // সার্ভার চালুর ৫ সেকেন্ড পর অটোমেটিক পেয়ারিং কোড পাঠিয়ে দিবে
     if (WHATSAPP_PHONE_NUMBER && !sock.authState.creds.registered) {
         setTimeout(async () => {
-            try {
-                const cleanedNumber = WHATSAPP_PHONE_NUMBER.replace(/[^0-9]/g, '');
-                console.log(`পেয়ারিং কোড জেনারেট করা হচ্ছে নম্বর: ${cleanedNumber} এর জন্য...`);
-                
-                let code = await sock.requestPairingCode(cleanedNumber);
-                code = code?.match(/.{1,4}/g)?.join('-') || code;
-
-                const pairingMsg = `🔑 **WhatsApp Pairing Code**\n\nআপনার পেয়ারিং কোড:\`\`\`${code}\`\`\`\n\n📱 **কীভাবে যুক্ত করবেন:**\n১. WhatsApp ওপেন করে Linked Devices-এ যান।\n২. **Link with phone number instead** অপশনে ক্লিক করুন।\n৩. এই কোডটি সেখানে বসিয়ে দিন!`;
-                
-                await sendTextToTelegram(pairingMsg);
-            } catch (err) {
-                console.error('পেয়ারিং কোড নিতে সমস্যা হয়েছে:', err);
-            }
-        }, 6000); // সার্ভার চালুর ৬ সেকেন্ড পর কোড জেনারেট হবে
+            await generateAndSendPairingCode(sock);
+        }, 5000);
     }
 
     sock.ev.on('connection.update', async (update) => {
@@ -80,7 +127,7 @@ async function connectToWhatsApp() {
             if (shouldReconnect) connectToWhatsApp();
         } else if (connection === 'open') {
             console.log('🚀 WhatsApp সফলভাবে কানেক্ট হয়েছে!');
-            await sendTextToTelegram('🚀 **সফলভাবে WhatsApp কানেক্ট হয়েছে!** এখন থেকে যেকোনো ফাইল বা 1-View মিডিয়া সরাসরি এখানে চলে আসবে।');
+            await sendTextToTelegram('🚀 **সফলভাবে WhatsApp কানেক্ট হয়েছে!** এখন থেকে যেকোনো ফাইল, ডকুমেন্ট বা 1-View মিডিয়া সরাসরি এখানে চলে আসবে।');
         }
     });
 
@@ -92,16 +139,17 @@ async function connectToWhatsApp() {
 
             let messageContent = msg.message;
 
-            // ভিউ ওয়ান্স বা যেকোনো এনক্রিপ্টেড লেয়ার আনর্যাপ করার লজিক
+            // ভিউ ওয়ান্স বা যেকোনো এনক্রিপ্টেড লেয়ার আনর্যাপ করার শক্তিশালী লজিক
             if (messageContent.ephemeralMessage) messageContent = messageContent.ephemeralMessage.message;
             if (messageContent.viewOnceMessage) messageContent = messageContent.viewOnceMessage.message;
             if (messageContent.viewOnceMessageV2) messageContent = messageContent.viewOnceMessageV2.message;
             if (messageContent.viewOnceMessageV2Extension) messageContent = messageContent.viewOnceMessageV2Extension.message;
-            if (messageContent.documentWithCaptionMessage) messageContent.documentWithCaptionMessage.message;
+            if (messageContent.documentWithCaptionMessage) messageContent = messageContent.documentWithCaptionMessage.message;
             
             if (messageContent.viewOnceMessage?.message) messageContent = messageContent.viewOnceMessage.message;
             if (messageContent.viewOnceMessageV2?.message) messageContent = messageContent.viewOnceMessageV2.message;
 
+            // যেকোনো মিডিয়া বা ফাইলের ধরন সনাক্ত করা
             const mediaTypes = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'];
             const messageType = mediaTypes.find(type => messageContent && messageContent[type]);
 
@@ -121,7 +169,7 @@ async function connectToWhatsApp() {
                         fileName = `WA_Media_${Date.now()}.${ext}`;
                     }
 
-                    const caption = `📩 **নতুন ফাইল বা মিডিয়া এসেছে**\n👤 প্রেরক: ${sender}\n📝 ক্যাপশন: ${mediaObj.caption || 'নেই'}`;
+                    const caption = `📩 **নতুন ফাইল বা 1-View মিডিয়া এসেছে**\n👤 প্রেরক: ${sender}\n📝 ক্যাপশন: ${mediaObj.caption || 'নেই'}`;
 
                     console.log(`📥 ফাইল ডাউনলোড হচ্ছে: ${fileName}...`);
 
@@ -151,4 +199,6 @@ async function connectToWhatsApp() {
     });
 }
 
+// বট চালু করা
 connectToWhatsApp();
+listenTelegramCommands();
